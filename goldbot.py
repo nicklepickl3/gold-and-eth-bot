@@ -2,20 +2,22 @@ import sys, time, json, os
 import numpy as np, pandas as pd, requests, yfinance as yf
 
 TICKER = "GC=F"
-INTERVAL = "15m"
+INTERVAL = "5m"
 PERIOD = "60d"
 TOPIC = os.environ.get("NTFY_TOPIC", "change-this-to-something-random-gold-x7q2")
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
 FEE = 0.0005
-CHECK_EVERY_MIN = 15
+CHECK_EVERY_SEC = 60
+BAR_MIN = 5
+FRESH_MIN = 20
 PRICE_ABOVE = None
 PRICE_BELOW = None
 STATE_FILE = "goldbot_state.json"
 
-def load():
-    df = yf.download(TICKER, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+def load(period=PERIOD):
+    df = yf.download(TICKER, period=period, interval=INTERVAL, progress=False, auto_adjust=True)
     return df["Close"].squeeze().dropna()
 
 def rsi(c, n):
@@ -34,6 +36,10 @@ def signals(c, st):
         r = rsi(c, st[1])
         E = r < st[2]
         X = r > st[3]
+    elif t == "band":
+        z = (c - c.rolling(st[1]).mean()) / c.rolling(st[1]).std()
+        E = z < -st[2]
+        X = z > 0
     else:
         n = st[1]
         E = c > c.shift(1).rolling(n).max()
@@ -45,6 +51,8 @@ def label(st):
         return f"SMA {st[1]}/{st[2]} cross"
     if st[0] == "rsi":
         return f"RSI {st[1]} buy<{st[2]} sell>{st[3]}"
+    if st[0] == "band":
+        return f"Band {st[1]} bars, {st[2]} dev"
     return f"Breakout {st[1]}-bar"
 
 def backtest(c, E, X, stop, rr):
@@ -80,11 +88,13 @@ def grid():
     S = [("sma", f, s) for f in (2, 3, 5, 8, 10) for s in (5, 8, 10, 20, 30, 50) if f < s]
     S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (25, 30, 35, 40, 45) for h in (50, 55, 60, 65)]
     S += [("brk", n) for n in (3, 5, 10, 20, 30)]
+    S += [("band", n, k) for n in (10, 20, 40) for k in (0.5, 0.8, 1.0, 1.5)]
     return [(st, sp, rr) for st in S for sp in (0.002, 0.003, 0.005, 0.0075, 0.01) for rr in (1, 1.5, 2, 3)]
 
 def optimize(c):
     cut = int(len(c) * 0.7)
     train, test = c.iloc[:cut], c.iloc[cut:]
+    days = max(1.0, (c.index[-1] - c.index[0]).total_seconds() / 86400 * 5 / 7)
     rows = []
     for st, sp, rr in grid():
         a = backtest(train, *signals(train, st), sp, rr)
@@ -92,9 +102,11 @@ def optimize(c):
             continue
         b = backtest(test, *signals(test, st), sp, rr)
         score = a["ret"] / (a["dd"] + 0.05)
-        rows.append(dict(st=st, stop=sp, rr=rr, train=a, test=b, score=score))
-    for min_train, min_test in ((30, 8), (20, 5), (10, 3)):
-        ok = [r for r in rows if r["train"]["n"] >= min_train and r["test"]["n"] >= min_test and r["test"]["ret"] > 0]
+        perday = 2 * (a["n"] + b["n"]) / days
+        rows.append(dict(st=st, stop=sp, rr=rr, train=a, test=b, score=score, perday=perday))
+    for want in (4, 3, 2, 1):
+        ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3
+              and r["test"]["ret"] > 0 and r["train"]["ret"] > 0 and r["test"]["dd"] <= 0.08]
         if ok:
             ok.sort(key=lambda r: r["score"], reverse=True)
             return ok
@@ -116,15 +128,19 @@ def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
 
 def check(best, state):
-    full = load()
+    full = load("5d")
     live = float(full.iloc[-1])
     c = full.iloc[:-1]
     st, sp, rr = best["st"], best["stop"], best["rr"]
     r = backtest(c, *signals(c, st), sp, rr)
     bar = str(c.index[-1])
+    ts = c.index[-1]
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    age = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60 - BAR_MIN
     name = f"{label(st)}, {sp*100:.2f}% stop, {rr}:1 target"
     size = CASH * r["frac"]
-    fresh = state.get("bar") != bar
+    fresh = state.get("bar") != bar and age <= FRESH_MIN
     if r["pe"] and fresh:
         msg = (f"{name}\nPrice ~{live:.2f}\nStop {live*(1-sp):.2f}  Target {live*(1+rr*sp):.2f}\n"
                f"Size ${size:.0f} of ${CASH:.0f}")
@@ -141,7 +157,9 @@ def check(best, state):
         state["below"] = PRICE_BELOW
     save_state(state)
     status = "BUY" if r["pe"] else "SELL" if r["px"] else "HOLD" if r["inpos"] else "WAIT"
-    print(time.strftime("%H:%M"), f"gold {live:.2f}", label(st), status, "trades in test:", best["test"]["n"])
+    if age > 60:
+        status += " (market closed or data stale)"
+    print(time.strftime("%H:%M:%S"), f"gold {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", flush=True)
 
 def pick():
     res = optimize(load())
@@ -163,12 +181,13 @@ if __name__ == "__main__":
         check(res[0], load_state())
         raise SystemExit
     best, last_opt, state = res[0], time.time(), load_state()
-    push("Gold bot started", f"Using {label(best['st'])}")
+    print("Using", label(best["st"]), best["stop"], best["rr"], f"~{best['perday']:.1f} signals/day", flush=True)
     while True:
+        t0 = time.time()
         try:
             if time.time() - last_opt > 86400:
                 best, last_opt = pick()[0], time.time()
             check(best, state)
         except Exception as e:
-            print("error:", e)
-        time.sleep(CHECK_EVERY_MIN * 60)
+            print("error:", e, flush=True)
+        time.sleep(max(5, CHECK_EVERY_SEC - (time.time() - t0)))
