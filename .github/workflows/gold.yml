@@ -1,0 +1,22 @@
+name: gold-bot
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy requests
+      - uses: actions/cache@v4
+        with:
+          path: goldbot_state.json
+          key: gold-state-${{ github.run_id }}
+          restore-keys: gold-state-
+      - run: python goldbot.py once
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
