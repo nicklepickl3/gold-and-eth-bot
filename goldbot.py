@@ -39,8 +39,9 @@ def signals(c, st):
     return E.fillna(False).values, X.fillna(False).values
 
 def label(st):
-    return {"sma": f"SMA {st[1]}/{st[2]} cross", "rsi": f"RSI {st[1]} buy<{st[2]} sell>{st[3]}",
-            "brk": f"Breakout {st[1]}-bar"}[st[0]]
+    if st[0] == "sma": return f"SMA {st[1]}/{st[2]} cross"
+    if st[0] == "rsi": return f"RSI {st[1]} buy<{st[2]} sell>{st[3]}"
+    return f"Breakout {st[1]}-bar"
 
 def backtest(c, E, X, stop, rr):
     p = c.values; frac = min(MAX_POS, RISK / stop)
@@ -109,7 +110,7 @@ def check(best, state):
     if PRICE_BELOW and live <= PRICE_BELOW and state.get("below") != PRICE_BELOW:
         push("GOLD below level", f"{live:.2f} <= {PRICE_BELOW}"); state["below"] = PRICE_BELOW
     save_state(state)
-    print(time.strftime("%H:%M"), f"gold {live:.2f}",
+    print(time.strftime("%H:%M"), f"gold {live:.2f}", label(st),
           "BUY" if r["pe"] else "SELL" if r["px"] else "HOLD" if r["inpos"] else "WAIT")
 
 def pick():
