@@ -126,4 +126,139 @@ def push(title, msg, prio="default"):
     except Exception as e:
         print("push failed:", e)
 
-def load_
+def load_state():
+    if os.path.exists(STATE_FILE):
+        return json.load(open(STATE_FILE))
+    return {"inpos": False, "ep": 0.0, "stop_price": 0.0, "target_price": 0.0, "bar": ""}
+
+def save_state(s):
+    json.dump(s, open(STATE_FILE, "w"))
+
+def check(best, state):
+    full = load("5d")
+    live = float(full.iloc[-1])
+    c = full.iloc[:-1]
+    st, sp, rr = best["st"], best["stop"], best["rr"]
+    r = backtest(c, *signals(c, st), sp, rr)
+    bar = str(c.index[-1])
+    ts = c.index[-1]
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    age = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60 - BAR_MIN
+    name = f"{label(st)}, {sp*100:.2f}% stop, {rr}:1 target"
+    size = CASH * r["frac"]
+    fresh = state.get("bar") != bar and age <= FRESH_MIN
+
+    inpos = state.get("inpos", False)
+    ep = state.get("ep", 0.0)
+    stop_price = state.get("stop_price", 0.0)
+    target_price = state.get("target_price", 0.0)
+
+    # Check price level alerts
+    if PRICE_ABOVE and live >= PRICE_ABOVE and state.get("above") != PRICE_ABOVE:
+        push("GOLD above level", f"{live:.2f} >= {PRICE_ABOVE}")
+        state["above"] = PRICE_ABOVE
+    if PRICE_BELOW and live <= PRICE_BELOW and state.get("below") != PRICE_BELOW:
+        push("GOLD below level", f"{live:.2f} <= {PRICE_BELOW}")
+        state["below"] = PRICE_BELOW
+
+    # Trading logic & notifications based on actual position state
+    if not inpos:
+        # Looking for buy entry
+        if r["pe"] and fresh:
+            ep = live
+            stop_price = ep * (1 - sp)
+            target_price = ep * (1 + rr * sp)
+            
+            state["inpos"] = True
+            state["ep"] = ep
+            state["stop_price"] = stop_price
+            state["target_price"] = target_price
+            state["bar"] = bar
+            
+            msg = (f"Strategy: {name}\n"
+                   f"Entry Price: ~{ep:.2f}\n"
+                   f"Stop Loss: {stop_price:.2f} (-{sp*100:.2f}%)\n"
+                   f"Take Profit: {target_price:.2f} (+{rr*sp*100:.2f}%)\n"
+                   f"Position Size: ${size:.0f} of ${CASH:.0f}\n"
+                   f"Confidence: Grade {best['grade']} (A best, C weakest)")
+            push("BUY GOLD NOW", msg, "high")
+    else:
+        # Currently in a position, monitor exits (Stop Loss, Take Profit, Technical Exit)
+        pnl_pct = (live - ep) / ep * 100
+        pnl_dlr = (live - ep) * (CASH * r["frac"] / ep)
+        
+        hit_stop = live <= stop_price
+        hit_target = live >= target_price
+        tech_exit = r["px"] and fresh
+
+        if hit_stop:
+            state["inpos"] = False
+            state["bar"] = bar
+            msg = (f"Strategy: {name}\n"
+                   f"Exit Price: ~{live:.2f} (Stop Loss Hit)\n"
+                   f"Entry Price: {ep:.2f}\n"
+                   f"P&L: {pnl_pct:+.2f}% (${pnl_dlr:+.0f})")
+            push("STOP LOSS", msg, "high")
+        elif hit_target:
+            state["inpos"] = False
+            state["bar"] = bar
+            msg = (f"Strategy: {name}\n"
+                   f"Exit Price: ~{live:.2f} (Take Profit Hit)\n"
+                   f"Entry Price: {ep:.2f}\n"
+                   f"P&L: {pnl_pct:+.2f}% (${pnl_dlr:+.0f})")
+            push("TAKE PROFIT", msg, "high")
+        elif tech_exit:
+            state["inpos"] = False
+            state["bar"] = bar
+            msg = (f"Strategy: {name}\n"
+                   f"Exit Price: ~{live:.2f} (Technical Exit Signal)\n"
+                   f"Entry Price: {ep:.2f}\n"
+                   f"P&L: {pnl_pct:+.2f}% (${pnl_dlr:+.0f})")
+            push("EXIT TRADE", msg, "high")
+
+    save_state(state)
+
+    # Console status output
+    if state.get("inpos"):
+        current_pnl = (live - ep) / ep * 100
+        status = f"IN POSITION (Entry: {ep:.2f} | Live: {live:.2f} | P&L: {current_pnl:+.2f}%)"
+    else:
+        status = "WAITING FOR BUY"
+        
+    if age > 60:
+        status += " (market closed or data stale)"
+        
+    print(time.strftime("%H:%M:%S"), f"gold {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
+
+def pick():
+    res = optimize(load())
+    if not res:
+        raise SystemExit("No setup held up on unseen data. Try a different interval.")
+    return res
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if mode == "test":
+        push("Gold bot test", "If you see this, alerts work.")
+        raise SystemExit
+    res = pick()
+    if mode == "backtest":
+        for r in res[:10]:
+            print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
+        raise SystemExit
+    if mode == "once":
+        check(res[0], load_state())
+        raise SystemExit
+    best, last_opt, state = res[0], time.time(), load_state()
+    print("Using", label(best["st"]), best["stop"], best["rr"], f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
+    push("Gold bot running", f"Using {label(best['st'])}, ~{best['perday']:.1f} signals/day, grade {best['grade']}", "low")
+    while True:
+        t0 = time.time()
+        try:
+            if time.time() - last_opt > 86400:
+                best, last_opt = pick()[0], time.time()
+            check(best, state)
+        except Exception as e:
+            print("error:", e, flush=True)
+        time.sleep(max(5, CHECK_EVERY_SEC - (time.time() - t0)))
