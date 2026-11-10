@@ -8,7 +8,7 @@ TOPIC = os.environ.get("NTFY_TOPIC", "change-this-to-something-random-gold-x7q2"
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
-FEE = 0.0005
+FEE = 0.0002
 CHECK_EVERY_SEC = 60
 BAR_MIN = 5
 FRESH_MIN = 20
@@ -104,12 +104,19 @@ def optimize(c):
         score = a["ret"] / (a["dd"] + 0.05)
         perday = 2 * (a["n"] + b["n"]) / days
         rows.append(dict(st=st, stop=sp, rr=rr, train=a, test=b, score=score, perday=perday))
-    for want in (4, 3, 2, 1):
-        ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3
-              and r["test"]["ret"] > 0 and r["train"]["ret"] > 0 and r["test"]["dd"] <= 0.08]
-        if ok:
-            ok.sort(key=lambda r: r["score"], reverse=True)
-            return ok
+    tiers = [
+        ("A", lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > 0 and r["test"]["dd"] <= 0.08),
+        ("B", lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > -0.01 and r["test"]["dd"] <= 0.10),
+        ("C", lambda r: r["train"]["ret"] > 0),
+    ]
+    for grade, good in tiers:
+        for want in (4, 3, 2, 1):
+            ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3 and good(r)]
+            if ok:
+                for r in ok:
+                    r["grade"] = grade
+                ok.sort(key=lambda r: r["score"], reverse=True)
+                return ok
     return []
 
 def push(title, msg, prio="default"):
@@ -143,11 +150,11 @@ def check(best, state):
     fresh = state.get("bar") != bar and age <= FRESH_MIN
     if r["pe"] and fresh:
         msg = (f"{name}\nPrice ~{live:.2f}\nStop {live*(1-sp):.2f}  Target {live*(1+rr*sp):.2f}\n"
-               f"Size ${size:.0f} of ${CASH:.0f}")
+               f"Size ${size:.0f} of ${CASH:.0f}\nConfidence: {best['grade']} (A best, C weakest)")
         push("GOLD: BUY signal", msg, "high")
         state["bar"] = bar
     elif r["px"] and fresh:
-        push("GOLD: SELL signal", f"{name}\nExit now, price ~{live:.2f}", "high")
+        push("GOLD: SELL signal", f"{name}\nExit now, price ~{live:.2f}\nConfidence: {best['grade']}", "high")
         state["bar"] = bar
     if PRICE_ABOVE and live >= PRICE_ABOVE and state.get("above") != PRICE_ABOVE:
         push("GOLD above level", f"{live:.2f} >= {PRICE_ABOVE}")
@@ -159,7 +166,7 @@ def check(best, state):
     status = "BUY" if r["pe"] else "SELL" if r["px"] else "HOLD" if r["inpos"] else "WAIT"
     if age > 60:
         status += " (market closed or data stale)"
-    print(time.strftime("%H:%M:%S"), f"gold {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", flush=True)
+    print(time.strftime("%H:%M:%S"), f"gold {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
 
 def pick():
     res = optimize(load())
@@ -181,7 +188,7 @@ if __name__ == "__main__":
         check(res[0], load_state())
         raise SystemExit
     best, last_opt, state = res[0], time.time(), load_state()
-    print("Using", label(best["st"]), best["stop"], best["rr"], f"~{best['perday']:.1f} signals/day", flush=True)
+    print("Using", label(best["st"]), best["stop"], best["rr"], f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
     while True:
         t0 = time.time()
         try:
