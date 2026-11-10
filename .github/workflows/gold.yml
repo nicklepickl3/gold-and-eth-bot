@@ -1,22 +1,21 @@
 name: gold-bot
 on:
   schedule:
-   - cron: "*/15 * * * *"
+    - cron: "0 */5 * * *"
   workflow_dispatch:
+concurrency:
+  group: gold-bot
+  cancel-in-progress: true
 jobs:
-  check:
+  watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install yfinance pandas numpy requests
-      - uses: actions/cache@v4
-        with:
-          path: goldbot_state.json
-          key: gold-state-${{ github.run_id }}
-          restore-keys: gold-state-
-      - run: python goldbot.py once
+      - run: timeout 350m python -u goldbot.py run || [ $? -eq 124 ]
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
