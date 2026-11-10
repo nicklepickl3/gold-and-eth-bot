@@ -187,8 +187,7 @@ if __name__ == "__main__":
     if mode == "once":
         check(res[0], load_state())
         raise SystemExit
-    
-        best, last_opt, state = res[0], time.time(), load_state()
+    best, last_opt, state = res[0], time.time(), load_state()
     print("Using", label(best["st"]), best["stop"], best["rr"], f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
     push("Gold bot running", f"Using {label(best['st'])}, ~{best['perday']:.1f} signals/day, grade {best['grade']}", "low")
     while True:
