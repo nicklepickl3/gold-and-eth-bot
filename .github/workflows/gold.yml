@@ -17,6 +17,9 @@ jobs:
           path: goldbot_state.json
           key: gold-state-${{ github.run_id }}
           restore-keys: gold-state-
+      - run: python goldbot.py test
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       - run: python goldbot.py once
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
