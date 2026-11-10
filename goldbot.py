@@ -77,10 +77,10 @@ def backtest(c, E, X, stop, rr):
     return dict(ret=ret, dd=dd, n=trades, pe=pe, px=px, inpos=sh > 0, ep=ep, frac=frac)
 
 def grid():
-    S = [("sma", f, s) for f in (3, 5, 8, 10) for s in (10, 20, 30, 50) if f < s]
-    S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (20, 25, 30, 35) for h in (55, 65, 70)]
-    S += [("brk", n) for n in (5, 10, 20, 30)]
-    return [(st, sp, rr) for st in S for sp in (0.003, 0.005, 0.0075, 0.01) for rr in (1.5, 2, 3)]
+    S = [("sma", f, s) for f in (2, 3, 5, 8, 10) for s in (5, 8, 10, 20, 30, 50) if f < s]
+    S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (25, 30, 35, 40, 45) for h in (50, 55, 60, 65)]
+    S += [("brk", n) for n in (3, 5, 10, 20, 30)]
+    return [(st, sp, rr) for st in S for sp in (0.002, 0.003, 0.005, 0.0075, 0.01) for rr in (1, 1.5, 2, 3)]
 
 def optimize(c):
     cut = int(len(c) * 0.7)
@@ -93,9 +93,12 @@ def optimize(c):
         b = backtest(test, *signals(test, st), sp, rr)
         score = a["ret"] / (a["dd"] + 0.05)
         rows.append(dict(st=st, stop=sp, rr=rr, train=a, test=b, score=score))
-    ok = [r for r in rows if r["test"]["ret"] > 0 and r["test"]["n"] >= 3]
-    ok.sort(key=lambda r: r["score"], reverse=True)
-    return ok
+    for min_train, min_test in ((30, 8), (20, 5), (10, 3)):
+        ok = [r for r in rows if r["train"]["n"] >= min_train and r["test"]["n"] >= min_test and r["test"]["ret"] > 0]
+        if ok:
+            ok.sort(key=lambda r: r["score"], reverse=True)
+            return ok
+    return []
 
 def push(title, msg, prio="default"):
     try:
@@ -138,7 +141,7 @@ def check(best, state):
         state["below"] = PRICE_BELOW
     save_state(state)
     status = "BUY" if r["pe"] else "SELL" if r["px"] else "HOLD" if r["inpos"] else "WAIT"
-    print(time.strftime("%H:%M"), f"gold {live:.2f}", label(st), status)
+    print(time.strftime("%H:%M"), f"gold {live:.2f}", label(st), status, "trades in test:", best["test"]["n"])
 
 def pick():
     res = optimize(load())
