@@ -11,6 +11,7 @@ MAX_POS = 0.50
 RISK = 0.01
 FEE = 0.0006
 CHECK_EVERY_SEC = 60
+MIN_PER_DAY = 4
 BAR_MIN = 5
 FRESH_MIN = 20
 PRICE_ABOVE = None
@@ -113,7 +114,8 @@ def optimize(c):
         "B": lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > -0.01 and r["test"]["dd"] <= 0.10,
         "C": lambda r: r["train"]["ret"] > 0,
     }
-    order = [(g, w) for w in (8, 6, 4, 3, 2, 1) for g in ("A", "B")]
+    order = [(g, w) for w in (8, 6, 4, 3, 2, 1) if w >= MIN_PER_DAY for g in ("A", "B", "C")]
+    order += [(g, w) for w in (8, 6, 4, 3, 2, 1) for g in ("A", "B")]
     order += [("C", w) for w in (8, 6, 4, 3, 2, 1)]
     for grade, want in order:
         ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3 and good[grade](r)]
