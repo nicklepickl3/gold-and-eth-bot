@@ -9,7 +9,7 @@ TOPIC = os.environ.get("NTFY_TOPIC", "change-this-to-something-random-gold-x7q2"
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
-FEE = 0.001
+FEE = 0.0006
 CHECK_EVERY_SEC = 60
 BAR_MIN = 5
 FRESH_MIN = 20
@@ -93,7 +93,7 @@ def grid():
     S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (25, 30, 35, 40, 45) for h in (50, 55, 60, 65)]
     S += [("brk", n) for n in (3, 5, 10, 20, 30)]
     S += [("band", n, k) for n in (10, 20, 40) for k in (0.3, 0.5, 0.8, 1.0)]
-    return [(st, sp, rr, hd) for st in S for sp in (0.003, 0.004, 0.006, 0.01) for rr in (1, 1.5, 2) for hd in (4, 8, 16)]
+    return [(st, sp, rr, hd) for st in S for sp in (0.004, 0.006, 0.01, 0.015) for rr in (1, 1.5, 2) for hd in (8, 16, 36, 72)]
 
 def optimize(c):
     cut = int(len(c) * 0.7)
@@ -222,17 +222,24 @@ def adopt_open_trade(best, state):
         push(f"{ASSET} trade may still be open", msg, "default", "information_source")
 
 def pick():
-    res = optimize(load())
-    if not res:
-        raise SystemExit("No setup held up on unseen data. Try a different interval.")
-    return res
+    return optimize(load())
 
-if __name__ == "__main__":
+def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
     if mode == "test":
         push("ETH bot test", "If you see this, alerts work.")
         raise SystemExit
     res = pick()
+    if not res and mode != "run":
+        raise SystemExit("No profitable setup found right now.")
+    told = False
+    while not res:
+        print("No profitable setup after fees. Checking again in 1 hour.", flush=True)
+        if not told:
+            push(f"{ASSET} bot waiting", "No setup is profitable after fees right now. I will keep checking every hour and start alerting when one is.", "low")
+            told = True
+        time.sleep(3600)
+        res = pick()
     if mode == "backtest":
         for r in res[:10]:
             print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
@@ -251,8 +258,14 @@ if __name__ == "__main__":
         t0 = time.time()
         try:
             if time.time() - last_opt > 86400:
-                best, last_opt = pick()[0], time.time()
+                new = pick()
+                if new:
+                    best = new[0]
+                last_opt = time.time()
             check(best, state)
         except Exception as e:
             print("error:", e, flush=True)
         time.sleep(max(5, CHECK_EVERY_SEC - (time.time() - t0)))
+
+if __name__ == "__main__":
+    main()
