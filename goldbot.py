@@ -4,7 +4,9 @@ import numpy as np, pandas as pd, requests, yfinance as yf
 TICKER = "GC=F"
 INTERVAL = "5m"
 PERIOD = "60d"
-TOPIC = os.environ.get("NTFY_TOPIC", "change-this-to-something-random-gold-x7q2")
+TOPIC = os.environ.get("NTFY_TOPIC", "goldbot-trader-x9k2p-secret-7711")
+
+
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
