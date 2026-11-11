@@ -1,20 +1,21 @@
 import sys, time, json, os
 import numpy as np, pandas as pd, requests, yfinance as yf
 
-TICKER = "GC=F"
+TICKER = "ETH-USD"
+ASSET = "ETH"
 INTERVAL = "5m"
 PERIOD = "60d"
 TOPIC = os.environ.get("NTFY_TOPIC", "change-this-to-something-random-gold-x7q2")
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
-FEE = 0.0002
+FEE = 0.0006
 CHECK_EVERY_SEC = 60
 BAR_MIN = 5
 FRESH_MIN = 20
 PRICE_ABOVE = None
 PRICE_BELOW = None
-STATE_FILE = "goldbot_state.json"
+STATE_FILE = "ethbot_state.json"
 
 def load(period=PERIOD):
     df = yf.download(TICKER, period=period, interval=INTERVAL, progress=False, auto_adjust=True)
@@ -92,12 +93,12 @@ def grid():
     S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (25, 30, 35, 40, 45) for h in (50, 55, 60, 65)]
     S += [("brk", n) for n in (3, 5, 10, 20, 30)]
     S += [("band", n, k) for n in (10, 20, 40) for k in (0.3, 0.5, 0.8, 1.0)]
-    return [(st, sp, rr, hd) for st in S for sp in (0.0015, 0.002, 0.003, 0.005) for rr in (1, 1.5, 2) for hd in (4, 8, 16)]
+    return [(st, sp, rr, hd) for st in S for sp in (0.004, 0.006, 0.01, 0.015) for rr in (1, 1.5, 2) for hd in (8, 16, 36, 72)]
 
 def optimize(c):
     cut = int(len(c) * 0.7)
     train, test = c.iloc[:cut], c.iloc[cut:]
-    days = max(1.0, (c.index[-1] - c.index[0]).total_seconds() / 86400 * 5 / 7)
+    days = max(1.0, (c.index[-1] - c.index[0]).total_seconds() / 86400)
     rows = []
     for st, sp, rr, hd in grid():
         a = backtest(train, *signals(train, st), sp, rr, hd)
@@ -155,7 +156,7 @@ def check(best, state):
         if E[-1] and state.get("bar") != bar and age <= FRESH_MIN:
             stop_p, tgt_p = live * (1 - sp), live * (1 + rr * sp)
             size = CASH * min(MAX_POS, RISK / sp)
-            msg = (f"Open a BUY on gold now.\n"
+            msg = (f"Open a BUY on {ASSET} now.\n"
                    f"Price: about {live:.2f}\n"
                    f"Set STOP LOSS at: {stop_p:.2f}\n"
                    f"Set TAKE PROFIT at: {tgt_p:.2f}\n"
@@ -164,7 +165,7 @@ def check(best, state):
                    f"I will message you when to get out.\n"
                    f"Confidence: {best['grade']} (A best, C weakest)\n"
                    f"Setup: {name}")
-            push("BUY GOLD NOW", msg, "high", "green_circle")
+            push(f"BUY {ASSET} NOW", msg, "high", "green_circle")
             state["pos"] = {"entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0}
             state["bar"] = bar
     else:
@@ -173,13 +174,13 @@ def check(best, state):
             pos["seen"] = bar
             pos["n"] = pos.get("n", 0) + 1
         if live <= pos["stop"]:
-            why = ("STOP LOSS - SELL GOLD NOW", "Price hit your stop. Close your gold BUY now to limit the loss.", "red_circle")
+            why = (f"STOP LOSS - SELL {ASSET} NOW", f"Price hit your stop. Close your {ASSET} BUY now to limit the loss.", "red_circle")
         elif live >= pos["target"]:
-            why = ("TAKE PROFIT - SELL GOLD NOW", "Price hit your target. Close your gold BUY now to lock in the profit.", "white_check_mark")
+            why = (f"TAKE PROFIT - SELL {ASSET} NOW", f"Price hit your target. Close your {ASSET} BUY now to lock in the profit.", "white_check_mark")
         elif X[-1] and bar != pos["bar"]:
-            why = ("EXIT TRADE - SELL GOLD NOW", "The setup says the move is over. Close your gold BUY now.", "warning")
+            why = (f"EXIT TRADE - SELL {ASSET} NOW", f"The setup says the move is over. Close your {ASSET} BUY now.", "warning")
         elif pos.get("n", 0) >= hd:
-            why = ("EXIT TRADE - SELL GOLD NOW", "Time is up on this quick trade. Close your gold BUY now.", "warning")
+            why = (f"EXIT TRADE - SELL {ASSET} NOW", f"Time is up on this quick trade. Close your {ASSET} BUY now.", "warning")
         if why:
             chg = (live / pos["entry"] - 1) * 100
             msg = (f"{why[1]}\n"
@@ -190,16 +191,16 @@ def check(best, state):
             state["pos"] = None
             state["bar"] = bar
     if PRICE_ABOVE and live >= PRICE_ABOVE and state.get("above") != PRICE_ABOVE:
-        push("GOLD above level", f"{live:.2f} >= {PRICE_ABOVE}")
+        push(f"{ASSET} above level", f"{live:.2f} >= {PRICE_ABOVE}")
         state["above"] = PRICE_ABOVE
     if PRICE_BELOW and live <= PRICE_BELOW and state.get("below") != PRICE_BELOW:
-        push("GOLD below level", f"{live:.2f} <= {PRICE_BELOW}")
+        push(f"{ASSET} below level", f"{live:.2f} <= {PRICE_BELOW}")
         state["below"] = PRICE_BELOW
     save_state(state)
     status = "BUY" if (pos is None and E[-1]) else "IN TRADE" if state.get("pos") else "WAIT"
     if age > 60:
-        status += " (market closed or data stale)"
-    print(time.strftime("%H:%M:%S"), f"gold {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
+        status += " (data stale)"
+    print(time.strftime("%H:%M:%S"), f"{ASSET} {live:.2f}", label(st), status, f"~{best['perday']:.1f} signals/day", "grade", best["grade"], flush=True)
 
 def adopt_open_trade(best, state):
     full = load("5d")
@@ -215,23 +216,30 @@ def adopt_open_trade(best, state):
     if mins <= 300:
         ep = r["ep"]
         state["pos"] = {"entry": ep, "stop": ep * (1 - sp), "target": ep * (1 + rr * sp), "bar": str(c.index[-1]), "seen": str(c.index[-1]), "n": len(c) - 1 - r["entry_i"]}
-        msg = (f"The bot restarted. A gold BUY from about {ep:.2f} may still be open.\n"
+        msg = (f"The bot restarted. An {ASSET} BUY from about {ep:.2f} may still be open.\n"
                f"If you took it: STOP LOSS {ep*(1-sp):.2f}, TAKE PROFIT {ep*(1+rr*sp):.2f}.\n"
                f"I will tell you when to get out. If you never bought, ignore this.")
-        push("Gold trade may still be open", msg, "default", "information_source")
+        push(f"{ASSET} trade may still be open", msg, "default", "information_source")
 
 def pick():
-    res = optimize(load())
-    if not res:
-        raise SystemExit("No setup held up on unseen data. Try a different interval.")
-    return res
+    return optimize(load())
 
-if __name__ == "__main__":
+def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
     if mode == "test":
-        push("Gold bot test", "If you see this, alerts work.")
+        push("ETH bot test", "If you see this, alerts work.")
         raise SystemExit
     res = pick()
+    if not res and mode != "run":
+        raise SystemExit("No profitable setup found right now.")
+    told = False
+    while not res:
+        print("No profitable setup after fees. Checking again in 1 hour.", flush=True)
+        if not told:
+            push(f"{ASSET} bot waiting", "No setup is profitable after fees right now. I will keep checking every hour and start alerting when one is.", "low")
+            told = True
+        time.sleep(3600)
+        res = pick()
     if mode == "backtest":
         for r in res[:10]:
             print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
@@ -245,13 +253,19 @@ if __name__ == "__main__":
         adopt_open_trade(best, state)
     except Exception as e:
         print("adopt error:", e, flush=True)
-    push("Gold bot running", f"Using {label(best['st'])}, ~{best['perday']:.1f} signals/day, grade {best['grade']}", "low")
+    push("ETH bot running", f"Using {label(best['st'])}, ~{best['perday']:.1f} signals/day, grade {best['grade']}", "low")
     while True:
         t0 = time.time()
         try:
             if time.time() - last_opt > 86400:
-                best, last_opt = pick()[0], time.time()
+                new = pick()
+                if new:
+                    best = new[0]
+                last_opt = time.time()
             check(best, state)
         except Exception as e:
             print("error:", e, flush=True)
         time.sleep(max(5, CHECK_EVERY_SEC - (time.time() - t0)))
+
+if __name__ == "__main__":
+    main()
