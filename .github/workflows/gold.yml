@@ -15,8 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install websockets requests
+      - run: pip install yfinance pandas numpy requests
       - run: timeout 350m python -u goldbot.py run || [ $? -eq 124 ]
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          DERIV_TOKEN: ${{ secrets.DERIV_TOKEN }}
