@@ -54,8 +54,8 @@ class DerivError(Exception):
 
 def notify(title, msg, priority="default", tags=""):
     print(f"[{dt.datetime.now():%H:%M:%S}] {title}: {msg}", flush=True)
-    if not TOPIC:
-        return
+    if not TOPIC or not title.startswith("SIGNAL"):
+        return  # only BUY/SELL signals go to ntfy
     try:
         requests.post(
             f"https://ntfy.sh/{TOPIC}",
