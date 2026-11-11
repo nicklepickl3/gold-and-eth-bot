@@ -7,7 +7,6 @@ Control it with goldctl.py.
 
 Setup:
     pip install websockets requests
-    export DERIV_TOKEN="your_api_token"     (Read scope is enough for signals)
     export NTFY_TOPIC="your_ntfy_topic"
     python goldbot.py --check               (verify login + gold symbol)
     python goldbot.py                       (run the bot)
@@ -41,10 +40,7 @@ MIN_STAKE = 1.0
 MAX_DAILY_LOSS = 0.03         # pause for the day at -3% of start balance
 
 STATE_FILE = "goldbot_state.json"
-TOKEN = os.environ.get("DERIV_TOKEN", "")
 TOPIC = os.environ.get("NTFY_TOPIC", "")
-APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-WS_URL = os.environ.get("DERIV_WS_URL", f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}")
 # ----------------------------------------
 
 
