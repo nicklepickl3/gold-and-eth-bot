@@ -11,8 +11,8 @@ except Exception:
 
 TICKER = "GC=F"           # gold futures
 ASSET = "GOLD"
-INTERVAL = "5m"
-PERIOD = "30d"            # smaller = faster optimize
+INTERVAL = "1m"          # 1-minute bars = many more signals
+PERIOD = "7d"             # max yfinance gives for 1m
 TOPIC = os.environ.get("NTFY_TOPIC", "PUT-YOUR-GOLD-NTFY-TOPIC-HERE")
 CASH = 10000.0
 MAX_POS = 0.50
@@ -22,8 +22,8 @@ ALLOW_SHORT = True        # True = SELL signals open short trades; False = BUY o
 CHECK_EVERY_SEC = 60
 QUIET_RETRY_MIN = 5       # minutes between retries when no setup is found
 RUN_MIN = 350             # bot stops after this many minutes
-BAR_MIN = 5
-FRESH_MIN = 20
+BAR_MIN = 1
+FRESH_MIN = 5
 STATE_FILE = "goldbot_state.json"
 
 
@@ -142,10 +142,10 @@ def backtest(c, sig, stop, rr, hold=9999):
 
 
 def grid():
-    S = [("sma", f, s) for f in (2, 3, 5, 8, 10) for s in (5, 8, 10, 20, 30, 50) if f < s]
-    S += [("rsi", p, l, h) for p in (2, 4, 7, 14) for l in (25, 30, 35, 40, 45) for h in (50, 55, 60, 65)]
-    S += [("brk", n) for n in (3, 5, 10, 20, 30)]
-    S += [("band", n, k) for n in (10, 20, 40) for k in (0.3, 0.5, 0.8, 1.0)]
+    S = [("sma", f, s) for f in (2, 3, 5, 8) for s in (5, 8, 10, 20, 30) if f < s]
+    S += [("rsi", p, l, h) for p in (2, 4, 7) for l in (30, 35, 40, 45, 50) for h in (50, 55, 60)]
+    S += [("brk", n) for n in (3, 5, 8, 10, 20)]
+    S += [("band", n, k) for n in (10, 20, 30) for k in (0.3, 0.5, 0.8, 1.0)]
     return S
 
 
@@ -157,9 +157,9 @@ def optimize(c):
     for st in grid():
         sig_t = signals(train, st)       # signals computed once per strategy
         sig_s = signals(test, st)
-        for sp in (0.004, 0.006, 0.01, 0.015):
+        for sp in (0.0015, 0.0025, 0.004, 0.006):
             for rr in (1, 1.5, 2):
-                for hd in (8, 16, 36, 72):
+                for hd in (5, 10, 20, 40):
                     a = backtest(train, sig_t, sp, rr, hd)
                     if a["n"] < 10:
                         continue
@@ -172,8 +172,8 @@ def optimize(c):
         "B": lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > -0.01 and r["test"]["dd"] <= 0.10,
         "C": lambda r: r["train"]["ret"] > 0,
     }
-    order = [(g, w) for w in (8, 6, 4, 3, 2, 1) for g in ("A", "B")]
-    order += [("C", w) for w in (8, 6, 4, 3, 2, 1)]
+    order = [(g, w) for w in (60, 40, 25, 15, 10, 6, 4, 2, 1) for g in ("A", "B")]
+    order += [("C", w) for w in (60, 40, 25, 15, 10, 6, 4, 2, 1)]
     for grade, want in order:
         ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3 and good[grade](r)]
         if ok:
@@ -206,7 +206,7 @@ def save_state(s):
 
 
 def check(best, state):
-    full = load("3d")
+    full = load("2d")
     live = float(full.iloc[-1])
     c = full.iloc[:-1]
     st, sp, rr, hd = best["st"], best["stop"], best["rr"], best["hold"]
