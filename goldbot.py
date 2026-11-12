@@ -18,6 +18,7 @@ CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
 FEE = 0.0006
+ALLOW_SHORT = True        # True = SELL signals open short trades; False = BUY only
 CHECK_EVERY_SEC = 60
 QUIET_RETRY_MIN = 5       # minutes between retries when no setup is found
 RUN_MIN = 350             # bot stops after this many minutes
@@ -39,74 +40,105 @@ def rsi(c, n):
 
 
 def signals(c, st):
+    """Returns entry-long, exit-long, entry-short, exit-short arrays."""
     t = st[0]
     if t == "sma":
         f, s = c.rolling(st[1]).mean(), c.rolling(st[2]).mean()
-        E = (f > s) & (f.shift(1) <= s.shift(1))
-        X = f < s
+        EL = (f > s) & (f.shift(1) <= s.shift(1))
+        XL = f < s
+        ES = (f < s) & (f.shift(1) >= s.shift(1))
+        XS = f > s
     elif t == "rsi":
         r = rsi(c, st[1])
-        E = r < st[2]
-        X = r > st[3]
+        EL = r < st[2]
+        XL = r > st[3]
+        ES = r > 100 - st[2]
+        XS = r < 100 - st[3]
     elif t == "band":
         z = (c - c.rolling(st[1]).mean()) / c.rolling(st[1]).std()
-        E = z < -st[2]
-        X = z > 0
+        EL = z < -st[2]
+        XL = z > 0
+        ES = z > st[2]
+        XS = z < 0
     else:
-        n = st[1]
-        E = c > c.shift(1).rolling(n).max()
-        X = c < c.shift(1).rolling(max(3, n // 2)).min()
-    return E.fillna(False).values.astype(np.bool_), X.fillna(False).values.astype(np.bool_)
+        n, m = st[1], max(3, st[1] // 2)
+        EL = c > c.shift(1).rolling(n).max()
+        XL = c < c.shift(1).rolling(m).min()
+        ES = c < c.shift(1).rolling(n).min()
+        XS = c > c.shift(1).rolling(m).max()
+    out = [x.fillna(False).values.astype(np.bool_) for x in (EL, XL, ES, XS)]
+    if not ALLOW_SHORT:
+        out[2][:] = False
+    return out
 
 
 def label(st):
     if st[0] == "sma":
         return f"SMA {st[1]}/{st[2]} cross"
     if st[0] == "rsi":
-        return f"RSI {st[1]} buy<{st[2]} sell>{st[3]}"
+        return f"RSI {st[1]} buy<{st[2]} sell>{100-st[2]}"
     if st[0] == "band":
         return f"Band {st[1]} bars, {st[2]} dev"
     return f"Breakout {st[1]}-bar"
 
 
 @njit(cache=True)
-def _bt(p, E, X, stop, rr, hold, frac, cash0, fee):
-    cash, sh, ep = cash0, 0.0, 0.0
-    pe, px = False, False
+def _bt(p, EL, XL, ES, XS, stop, rr, hold, frac, cash0, fee):
+    cash, units, ep = cash0, 0.0, 0.0
+    side, pend = 0, 0            # side: 1 long, -1 short, 0 flat
+    px = False
     trades, entry_i, held = 0, -1, 0
     peak, maxdd, last = cash0, 0.0, cash0
     for i in range(len(p)):
-        if sh == 0.0 and pe:
+        if side == 0 and pend != 0:
             amt = cash * frac
-            sh = amt * (1 - fee) / p[i]
+            units = amt * (1 - fee) / p[i]
             cash -= amt
             ep = p[i]
+            side = pend
             entry_i = i
             held = 0
-        if sh > 0.0 and px:
-            cash += sh * p[i] * (1 - fee)
-            sh = 0.0
+        elif side != 0 and px:
+            if side == 1:
+                val = units * p[i]
+            else:
+                val = units * (2 * ep - p[i])
+            cash += val * (1 - fee)
+            units = 0.0
+            side = 0
             trades += 1
-        pe = False
+        pend = 0
         px = False
-        if sh > 0.0:
+        if side == 1:
             held += 1
-            px = (p[i] <= ep * (1 - stop)) or (p[i] >= ep * (1 + rr * stop)) or X[i] or held >= hold
+            px = (p[i] <= ep * (1 - stop)) or (p[i] >= ep * (1 + rr * stop)) or XL[i] or held >= hold
+        elif side == -1:
+            held += 1
+            px = (p[i] >= ep * (1 + stop)) or (p[i] <= ep * (1 - rr * stop)) or XS[i] or held >= hold
         else:
-            pe = E[i]
-        last = cash + sh * p[i]
+            if EL[i]:
+                pend = 1
+            elif ES[i]:
+                pend = -1
+        if side == 1:
+            last = cash + units * p[i]
+        elif side == -1:
+            last = cash + units * (2 * ep - p[i])
+        else:
+            last = cash
         if last > peak:
             peak = last
         dd = 1 - last / peak
         if dd > maxdd:
             maxdd = dd
-    return last / cash0 - 1, maxdd, trades, pe, px, sh > 0.0, ep, entry_i
+    return last / cash0 - 1, maxdd, trades, side, ep, entry_i
 
 
-def backtest(c, E, X, stop, rr, hold=9999):
+def backtest(c, sig, stop, rr, hold=9999):
     frac = min(MAX_POS, RISK / stop)
-    ret, dd, n, pe, px, inpos, ep, ei = _bt(c.values.astype(np.float64), E, X, stop, rr, hold, frac, CASH, FEE)
-    return dict(ret=ret, dd=dd, n=n, pe=pe, px=px, inpos=inpos, ep=ep, frac=frac, entry_i=ei)
+    EL, XL, ES, XS = sig
+    ret, dd, n, side, ep, ei = _bt(c.values.astype(np.float64), EL, XL, ES, XS, stop, rr, hold, frac, CASH, FEE)
+    return dict(ret=ret, dd=dd, n=n, side=side, ep=ep, entry_i=ei)
 
 
 def grid():
@@ -123,15 +155,15 @@ def optimize(c):
     days = max(1.0, (c.index[-1] - c.index[0]).total_seconds() / 86400)
     rows = []
     for st in grid():
-        Et, Xt = signals(train, st)      # signals computed once per strategy
-        Es, Xs = signals(test, st)
+        sig_t = signals(train, st)       # signals computed once per strategy
+        sig_s = signals(test, st)
         for sp in (0.004, 0.006, 0.01, 0.015):
             for rr in (1, 1.5, 2):
                 for hd in (8, 16, 36, 72):
-                    a = backtest(train, Et, Xt, sp, rr, hd)
+                    a = backtest(train, sig_t, sp, rr, hd)
                     if a["n"] < 10:
                         continue
-                    b = backtest(test, Es, Xs, sp, rr, hd)
+                    b = backtest(test, sig_s, sp, rr, hd)
                     score = a["ret"] / (a["dd"] + 0.05)
                     perday = 2 * (a["n"] + b["n"]) / days
                     rows.append(dict(st=st, stop=sp, rr=rr, hold=hd, train=a, test=b, score=score, perday=perday))
@@ -178,7 +210,7 @@ def check(best, state):
     live = float(full.iloc[-1])
     c = full.iloc[:-1]
     st, sp, rr, hd = best["st"], best["stop"], best["rr"], best["hold"]
-    E, X = signals(c, st)
+    EL, XL, ES, XS = signals(c, st)
     bar = str(c.index[-1])
     ts = c.index[-1]
     if ts.tzinfo is None:
@@ -187,39 +219,52 @@ def check(best, state):
     name = f"{label(st)}, {sp*100:.2f}% stop, {rr}:1 target"
     pos = state.get("pos")
     if pos is None:
-        if E[-1] and state.get("bar") != bar and age <= FRESH_MIN:
-            stop_p, tgt_p = live * (1 - sp), live * (1 + rr * sp)
+        side = 1 if EL[-1] else (-1 if ES[-1] else 0)
+        if side and state.get("bar") != bar and age <= FRESH_MIN:
+            if side == 1:
+                stop_p, tgt_p = live * (1 - sp), live * (1 + rr * sp)
+            else:
+                stop_p, tgt_p = live * (1 + sp), live * (1 - rr * sp)
+            word = "BUY" if side == 1 else "SELL"
             size = CASH * min(MAX_POS, RISK / sp)
             msg = (f"{name}\n"
                    f"Price ~{live:.2f}\n"
                    f"Stop {stop_p:.2f}  Target {tgt_p:.2f}\n"
                    f"Size ${size:.0f} of ${CASH:.0f}\n"
                    f"Confidence: {best['grade']} (A best, C weakest)")
-            push(f"{ASSET}: BUY signal", msg, "high", "green_circle")
-            state["pos"] = {"entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0}
+            push(f"{ASSET}: {word} signal", msg, "high", "green_circle" if side == 1 else "red_circle")
+            state["pos"] = {"side": side, "entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0}
             state["bar"] = bar
     else:
+        side = pos.get("side", 1)
         why = None
         if pos.get("seen") != bar:
             pos["seen"] = bar
             pos["n"] = pos.get("n", 0) + 1
-        if live <= pos["stop"]:
+        xnow = XL[-1] if side == 1 else XS[-1]
+        hit_stop = live <= pos["stop"] if side == 1 else live >= pos["stop"]
+        hit_tgt = live >= pos["target"] if side == 1 else live <= pos["target"]
+        if hit_stop:
             why = "stop hit"
-        elif live >= pos["target"]:
+        elif hit_tgt:
             why = "target hit"
-        elif X[-1] and bar != pos["bar"]:
+        elif xnow and bar != pos["bar"]:
             why = "setup over"
         elif pos.get("n", 0) >= hd:
             why = "time up"
         if why:
+            word = "BUY" if side == 1 else "SELL"
+            pnl = side * (live / pos["entry"] - 1) * 100
             msg = (f"{name}\n"
-                   f"Exit now ({why}), price ~{live:.2f}\n"
+                   f"Close your {word} now ({why}), price ~{live:.2f}\n"
+                   f"Entered ~{pos['entry']:.2f} ({pnl:+.2f}%)\n"
                    f"Confidence: {best['grade']}")
-            push(f"{ASSET}: SELL signal", msg, "high", "red_circle")
+            push(f"{ASSET}: EXIT TRADE", msg, "high", "warning")
             state["pos"] = None
             state["bar"] = bar
     save_state(state)
-    status = "IN TRADE" if state.get("pos") else ("BUY" if E[-1] else "WAIT")
+    p = state.get("pos")
+    status = ("IN " + ("BUY" if p.get("side", 1) == 1 else "SELL")) if p else ("BUY" if EL[-1] else "SELL" if ES[-1] else "WAIT")
     print(time.strftime("%H:%M:%S"), f"{ASSET} {live:.2f}", label(st), status, flush=True)
 
 
@@ -240,7 +285,7 @@ def main():
             print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
         raise SystemExit
     if mode != "once":
-        push(f"{ASSET} bot: running", f"The bot is running for the next {RUN_MIN} min. You will only get BUY and SELL signals.", "low", "robot")
+        push(f"{ASSET} bot: running", f"The bot is running for the next {RUN_MIN} min. You will get BUY, SELL and EXIT TRADE signals.", "low", "robot")
     while not res and time.time() < end:        # quiet period: log every minute, retry every 5 min
         for _ in range(QUIET_RETRY_MIN):
             print(time.strftime("%H:%M:%S"), f"{ASSET} no profitable setup, waiting", flush=True)
