@@ -17,13 +17,14 @@ TOPIC = os.environ.get("NTFY_TOPIC", "PUT-YOUR-GOLD-NTFY-TOPIC-HERE")
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
-FEE = 0.0006
+FEE = 0.0002              # per side; set to your broker cost
+TARGET_PER_DAY = 15       # trades per day the bot aims for
 ALLOW_SHORT = True        # True = SELL signals open short trades; False = BUY only
 CHECK_EVERY_SEC = 60
 QUIET_RETRY_MIN = 5       # minutes between retries when no setup is found
 RUN_MIN = 350             # bot stops after this many minutes
 BAR_MIN = 1
-FRESH_MIN = 5
+FRESH_MIN = 10           # signals older than this many minutes are ignored
 STATE_FILE = "goldbot_state.json"
 
 
@@ -84,10 +85,10 @@ def label(st):
 
 @njit(cache=True)
 def _bt(p, EL, XL, ES, XS, stop, rr, hold, frac, cash0, fee):
-    cash, units, ep = cash0, 0.0, 0.0
+    cash, units, ep, amt = cash0, 0.0, 0.0, 0.0
     side, pend = 0, 0            # side: 1 long, -1 short, 0 flat
     px = False
-    trades, entry_i, held = 0, -1, 0
+    trades, wins, entry_i, held = 0, 0, -1, 0
     peak, maxdd, last = cash0, 0.0, cash0
     for i in range(len(p)):
         if side == 0 and pend != 0:
@@ -104,6 +105,8 @@ def _bt(p, EL, XL, ES, XS, stop, rr, hold, frac, cash0, fee):
             else:
                 val = units * (2 * ep - p[i])
             cash += val * (1 - fee)
+            if val * (1 - fee) > amt:
+                wins += 1
             units = 0.0
             side = 0
             trades += 1
@@ -131,14 +134,14 @@ def _bt(p, EL, XL, ES, XS, stop, rr, hold, frac, cash0, fee):
         dd = 1 - last / peak
         if dd > maxdd:
             maxdd = dd
-    return last / cash0 - 1, maxdd, trades, side, ep, entry_i
+    return last / cash0 - 1, maxdd, trades, wins, side, ep, entry_i
 
 
 def backtest(c, sig, stop, rr, hold=9999):
     frac = min(MAX_POS, RISK / stop)
     EL, XL, ES, XS = sig
-    ret, dd, n, side, ep, ei = _bt(c.values.astype(np.float64), EL, XL, ES, XS, stop, rr, hold, frac, CASH, FEE)
-    return dict(ret=ret, dd=dd, n=n, side=side, ep=ep, entry_i=ei)
+    ret, dd, n, w, side, ep, ei = _bt(c.values.astype(np.float64), EL, XL, ES, XS, stop, rr, hold, frac, CASH, FEE)
+    return dict(ret=ret, dd=dd, n=n, w=w, side=side, ep=ep, entry_i=ei)
 
 
 def grid():
@@ -152,7 +155,7 @@ def grid():
 def optimize(c):
     cut = int(len(c) * 0.7)
     train, test = c.iloc[:cut], c.iloc[cut:]
-    days = max(1.0, (c.index[-1] - c.index[0]).total_seconds() / 86400)
+    days = max(0.5, len(c) / 1380.0)      # trading days (gold trades ~23h/day)
     rows = []
     for st in grid():
         sig_t = signals(train, st)       # signals computed once per strategy
@@ -165,17 +168,20 @@ def optimize(c):
                         continue
                     b = backtest(test, sig_s, sp, rr, hd)
                     score = a["ret"] / (a["dd"] + 0.05)
-                    perday = 2 * (a["n"] + b["n"]) / days
-                    rows.append(dict(st=st, stop=sp, rr=rr, hold=hd, train=a, test=b, score=score, perday=perday))
+                    perday = (a["n"] + b["n"]) / days
+                    wr = 100.0 * (a["w"] + b["w"]) / (a["n"] + b["n"])
+                    rows.append(dict(st=st, stop=sp, rr=rr, hold=hd, train=a, test=b, score=score, perday=perday, wr=wr))
     good = {
         "A": lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > 0 and r["test"]["dd"] <= 0.08,
         "B": lambda r: r["train"]["ret"] > 0 and r["test"]["ret"] > -0.01 and r["test"]["dd"] <= 0.10,
         "C": lambda r: r["train"]["ret"] > 0,
     }
-    order = [(g, w) for w in (60, 40, 25, 15, 10, 6, 4, 2, 1) for g in ("A", "B")]
-    order += [("C", w) for w in (60, 40, 25, 15, 10, 6, 4, 2, 1)]
-    for grade, want in order:
-        ok = [r for r in rows if r["perday"] >= want and r["test"]["n"] >= 3 and good[grade](r)]
+    T = TARGET_PER_DAY
+    bands = [(0.8 * T, 1.5 * T), (0.5 * T, 3 * T), (0.25 * T, 1e9), (1, 1e9)]
+    order = [(g, lo, hi) for lo, hi in bands for g in ("A", "B")]
+    order += [("C", lo, hi) for lo, hi in bands]
+    for grade, lo, hi in order:
+        ok = [r for r in rows if lo <= r["perday"] <= hi and r["test"]["n"] >= 3 and good[grade](r)]
         if ok:
             for r in ok:
                 r["grade"] = grade
@@ -231,7 +237,7 @@ def check(best, state):
                    f"Price ~{live:.2f}\n"
                    f"Stop {stop_p:.2f}  Target {tgt_p:.2f}\n"
                    f"Size ${size:.0f} of ${CASH:.0f}\n"
-                   f"Confidence: {best['grade']} (A best, C weakest)")
+                   f"Confidence: {best['grade']} ({best['wr']:.0f}% of past trades won)")
             push(f"{ASSET}: {word} signal", msg, "high", "green_circle" if side == 1 else "red_circle")
             state["pos"] = {"side": side, "entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0}
             state["bar"] = bar
@@ -258,14 +264,14 @@ def check(best, state):
             msg = (f"{name}\n"
                    f"Close your {word} now ({why}), price ~{live:.2f}\n"
                    f"Entered ~{pos['entry']:.2f} ({pnl:+.2f}%)\n"
-                   f"Confidence: {best['grade']}")
+                   f"Confidence: {best['grade']} ({best['wr']:.0f}% of past trades won)")
             push(f"{ASSET}: EXIT TRADE", msg, "high", "warning")
             state["pos"] = None
             state["bar"] = bar
     save_state(state)
     p = state.get("pos")
     status = ("IN " + ("BUY" if p.get("side", 1) == 1 else "SELL")) if p else ("BUY" if EL[-1] else "SELL" if ES[-1] else "WAIT")
-    print(time.strftime("%H:%M:%S"), f"{ASSET} {live:.2f}", label(st), status, flush=True)
+    print(time.strftime("%H:%M:%S"), f"{ASSET} {live:.2f}", label(st), status, f"data age {age:.0f} min", flush=True)
 
 
 def pick():
@@ -285,7 +291,7 @@ def main():
             print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
         raise SystemExit
     if mode != "once":
-        push(f"{ASSET} bot: running", f"The bot is running for the next {RUN_MIN} min. You will get BUY, SELL and EXIT TRADE signals.", "low", "robot")
+        push(f"{ASSET} bot: running", f"The bot is running for the next {RUN_MIN} min. Aiming for ~{TARGET_PER_DAY} trades/day.", "low", "robot")
     while not res and time.time() < end:        # quiet period: log every minute, retry every 5 min
         for _ in range(QUIET_RETRY_MIN):
             print(time.strftime("%H:%M:%S"), f"{ASSET} no profitable setup, waiting", flush=True)
@@ -294,7 +300,7 @@ def main():
     state = load_state()
     if res:
         best = res[0]
-        print("Using", label(best["st"]), best["stop"], best["rr"], "grade", best["grade"], flush=True)
+        print("Using", label(best["st"]), best["stop"], best["rr"], "grade", best["grade"], f"~{best['perday']:.0f} trades/day", flush=True)
         if mode == "once":
             check(best, state)
             raise SystemExit
