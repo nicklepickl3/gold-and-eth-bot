@@ -1,0 +1,32 @@
+name: ETH bot
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"      # start a new run every 6 hours
+  workflow_dispatch:            # lets you start it by hand from the Actions tab
+
+# Never run two at once, and never cancel a running bot
+concurrency:
+  group: ethbot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # bot stops itself at 350 min; GitHub's hard limit is 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packages
+        run: pip install numpy pandas requests yfinance numba
+
+      - name: Run bot
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -u ethbot.py
