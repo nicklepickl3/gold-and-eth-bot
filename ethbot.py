@@ -11,21 +11,21 @@ except Exception:
 
 TICKER = "ETH-USD"
 ASSET = "ETH"
-BARS_PER_DAY = 1440       # crypto trades 24/7
-INTERVAL = "1m"          # 1-minute bars = many more signals
-PERIOD = "7d"             # max yfinance gives for 1m
+BARS_PER_DAY = 288        # crypto trades 24/7 (5-min bars)
+INTERVAL = "5m"          # 5-minute bars: far fewer fake signals, better confidence
+PERIOD = "60d"
 TOPIC = os.environ.get("NTFY_TOPIC", "PUT-YOUR-ETH-NTFY-TOPIC-HERE")
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
 FEE = 0.0006              # per side; set to your exchange cost
-TARGET_PER_DAY = 15       # trades per day the bot aims for
+TARGET_PER_DAY = 8        # trades per day the bot aims for
 ALLOW_SHORT = True        # True = SELL signals open short trades; False = BUY only
 CHECK_EVERY_SEC = 60
 QUIET_RETRY_MIN = 5       # minutes between retries when no setup is found
 RUN_MIN = 350             # bot stops after this many minutes
-BAR_MIN = 1
-FRESH_MIN = 10           # crypto data is near live; signals older than this are ignored
+BAR_MIN = 5
+FRESH_MIN = 20           # crypto data is near live; signals older than this are ignored
 STATE_FILE = "ethbot_state.json"
 
 
@@ -173,9 +173,9 @@ def optimize(c):
     for st in grid():
         sig_t = signals(train, st)       # signals computed once per strategy
         sig_s = signals(test, st)
-        for sp in (0.002, 0.003, 0.005, 0.008):
+        for sp in (0.004, 0.006, 0.01, 0.015):
             for rr in (1, 1.5, 2):
-                for hd in (5, 10, 20, 40):
+                for hd in (8, 16, 36, 72):
                     a = backtest(train, sig_t, sp, rr, hd)
                     if a["n"] < 10:
                         continue
