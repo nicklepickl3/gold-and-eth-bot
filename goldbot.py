@@ -29,8 +29,20 @@ STATE_FILE = "goldbot_state.json"
 
 
 def load(period=PERIOD):
-    df = yf.download(TICKER, period=period, interval=INTERVAL, progress=False, auto_adjust=True)
-    return df["Close"].squeeze().dropna()
+    for attempt in range(3):
+        try:
+            df = yf.download(TICKER, period=period, interval=INTERVAL, progress=False, auto_adjust=True)
+            if df is not None and len(df) > 0 and "Close" in df:
+                c = df["Close"]
+                if isinstance(c, pd.DataFrame):
+                    c = c.iloc[:, 0]
+                c = c.dropna().astype(float)
+                if len(c) > 0:
+                    return c
+        except Exception as e:
+            print("data error:", e, flush=True)
+        time.sleep(3)
+    return pd.Series(dtype=float)
 
 
 def rsi(c, n):
@@ -187,7 +199,16 @@ def optimize(c):
                 r["grade"] = grade
             ok.sort(key=lambda r: r["score"], reverse=True)
             return ok
-    return []
+    # nothing beat fees: still send signals, using the least-bad setup near the target (grade D)
+    near = [r for r in rows if 0.5 * T <= r["perday"] <= 3 * T] or rows
+    if near:
+        near.sort(key=lambda r: r["score"], reverse=True)
+        for r in near:
+            r["grade"] = "D"
+        return near
+    z = dict(ret=0.0, dd=0.0, n=0, w=0)
+    return [dict(st=("rsi", 7, 35, 55), stop=0.003, rr=1.5, hold=20, train=z, test=z,
+                 score=0.0, perday=0.0, wr=0.0, grade="D")]
 
 
 def push(title, msg, prio="high", tags=""):
@@ -213,6 +234,9 @@ def save_state(s):
 
 def check(best, state):
     full = load("2d")
+    if len(full) < 60:
+        print(time.strftime("%H:%M:%S"), "no fresh data, skipping", flush=True)
+        return
     live = float(full.iloc[-1])
     c = full.iloc[:-1]
     st, sp, rr, hd = best["st"], best["stop"], best["rr"], best["hold"]
@@ -239,7 +263,7 @@ def check(best, state):
                    f"Size ${size:.0f} of ${CASH:.0f}\n"
                    f"Confidence: {best['grade']} ({best['wr']:.0f}% of past trades won)")
             push(f"{ASSET}: {word} signal", msg, "high", "green_circle" if side == 1 else "red_circle")
-            state["pos"] = {"side": side, "entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0}
+            state["pos"] = {"side": side, "entry": live, "stop": stop_p, "target": tgt_p, "bar": bar, "seen": bar, "n": 0, "t": time.time()}
             state["bar"] = bar
     else:
         side = pos.get("side", 1)
@@ -275,7 +299,15 @@ def check(best, state):
 
 
 def pick():
-    return optimize(load())
+    try:
+        c = load()
+        if len(c) < 300:
+            print("not enough data yet", flush=True)
+            return []
+        return optimize(c)
+    except Exception as e:
+        print("optimize error:", e, flush=True)
+        return []
 
 
 def main():
@@ -290,14 +322,19 @@ def main():
         for r in res[:10]:
             print(label(r["st"]), r["stop"], r["rr"], round(r["train"]["ret"] * 100, 1), round(r["test"]["ret"] * 100, 1))
         raise SystemExit
+    if mode in ("once", "backtest") and not res:
+        raise SystemExit("No profitable setup found right now.")
     if mode != "once":
         push(f"{ASSET} bot: running", f"The bot is running for the next {RUN_MIN} min. Aiming for ~{TARGET_PER_DAY} trades/day.", "low", "robot")
     while not res and time.time() < end:        # quiet period: log every minute, retry every 5 min
         for _ in range(QUIET_RETRY_MIN):
-            print(time.strftime("%H:%M:%S"), f"{ASSET} no profitable setup, waiting", flush=True)
+            print(time.strftime("%H:%M:%S"), f"{ASSET} no setup or no data, waiting", flush=True)
             time.sleep(60)
         res = pick()
     state = load_state()
+    p0 = state.get("pos")
+    if p0 and time.time() - p0.get("t", 0) > 7200:     # old trade from a previous run: forget it
+        state["pos"] = None
     if res:
         best = res[0]
         print("Using", label(best["st"]), best["stop"], best["rr"], "grade", best["grade"], f"~{best['perday']:.0f} trades/day", flush=True)
