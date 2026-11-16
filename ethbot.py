@@ -200,7 +200,16 @@ def optimize(c):
                 r["grade"] = grade
             ok.sort(key=lambda r: r["score"], reverse=True)
             return ok
-    return []
+    # nothing beat fees: still send signals, using the least-bad setup near the target (grade D)
+    near = [r for r in rows if 0.5 * T <= r["perday"] <= 3 * T] or rows
+    if near:
+        near.sort(key=lambda r: r["score"], reverse=True)
+        for r in near:
+            r["grade"] = "D"
+        return near
+    z = dict(ret=0.0, dd=0.0, n=0, w=0)
+    return [dict(st=("rsi", 7, 35, 55), stop=0.003, rr=1.5, hold=20, train=z, test=z,
+                 score=0.0, perday=0.0, wr=0.0, grade="D")]
 
 
 def push(title, msg, prio="high", tags=""):
