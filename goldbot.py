@@ -11,20 +11,20 @@ except Exception:
 
 TICKER = "GC=F"           # gold futures
 ASSET = "GOLD"
-INTERVAL = "1m"          # 1-minute bars = many more signals
-PERIOD = "7d"             # max yfinance gives for 1m
+INTERVAL = "5m"          # 5-minute bars: far fewer fake signals, better confidence
+PERIOD = "60d"
 TOPIC = os.environ.get("NTFY_TOPIC", "PUT-YOUR-GOLD-NTFY-TOPIC-HERE")
 CASH = 10000.0
 MAX_POS = 0.50
 RISK = 0.01
 FEE = 0.0002              # per side; set to your broker cost
-TARGET_PER_DAY = 15       # trades per day the bot aims for
+TARGET_PER_DAY = 8        # trades per day the bot aims for
 ALLOW_SHORT = True        # True = SELL signals open short trades; False = BUY only
 CHECK_EVERY_SEC = 60
 QUIET_RETRY_MIN = 5       # minutes between retries when no setup is found
 RUN_MIN = 350             # bot stops after this many minutes
-BAR_MIN = 1
-FRESH_MIN = 10           # signals older than this many minutes are ignored
+BAR_MIN = 5
+FRESH_MIN = 20           # signals older than this many minutes are ignored
 STATE_FILE = "goldbot_state.json"
 
 
@@ -167,14 +167,14 @@ def grid():
 def optimize(c):
     cut = int(len(c) * 0.7)
     train, test = c.iloc[:cut], c.iloc[cut:]
-    days = max(0.5, len(c) / 1380.0)      # trading days (gold trades ~23h/day)
+    days = max(0.5, len(c) / 276.0)       # trading days (gold trades ~23h/day, 5-min bars)
     rows = []
     for st in grid():
         sig_t = signals(train, st)       # signals computed once per strategy
         sig_s = signals(test, st)
-        for sp in (0.0015, 0.0025, 0.004, 0.006):
+        for sp in (0.003, 0.005, 0.008, 0.012):
             for rr in (1, 1.5, 2):
-                for hd in (5, 10, 20, 40):
+                for hd in (8, 16, 36, 72):
                     a = backtest(train, sig_t, sp, rr, hd)
                     if a["n"] < 10:
                         continue
