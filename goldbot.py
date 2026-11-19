@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-goldbot.py - Gold SIGNALS ONLY bot (Deriv price data -> ntfy alerts).
-Places NO trades. A Deriv token with Read scope is enough.
+goldbot.py - Gold SIGNALS ONLY bot (Deriv public price data -> ntfy alerts).
+Places NO trades. No Deriv login or token needed.
 
 pip install websockets requests
-env: DERIV_TOKEN, NTFY_TOPIC, optional COPY_TOPIC, NEWS_RSS
-python goldbot.py --check   (test login + gold symbol)
+env: NTFY_TOPIC, optional COPY_TOPIC, NEWS_RSS
+python goldbot.py --check   (test gold symbol + data)
 python goldbot.py           (run)
 Works with goldctl.py (same state file).
 """
@@ -53,7 +53,6 @@ BEAR = ["rate hike", "stronger dollar", "dollar rises", "gold falls", "gold drop
 COPY_TOPIC = os.environ.get("COPY_TOPIC", "")
 
 STATE_FILE = "goldbot_state.json"
-TOKEN = os.environ.get("DERIV_TOKEN", "")
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 WS_URL = os.environ.get("DERIV_WS_URL", f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}")
@@ -242,7 +241,7 @@ def copycat():
     return last
 
 
-# ---------- DERIV (read-only market data) ----------
+# ---------- DERIV (public market data, no login) ----------
 class Deriv:
     def __init__(self):
         self.ws = None
@@ -261,9 +260,6 @@ class Deriv:
                     e = msg["error"]
                     raise DerivError(f"{e.get('code')}: {e.get('message')}")
                 return msg
-
-    async def authorize(self):
-        return (await self.call({"authorize": TOKEN}))["authorize"]
 
     async def candles(self, gran=BAR_MIN * 60, count=CANDLES):
         r = await self.call({"ticks_history": SYMBOL, "adjust_start_time": 1, "count": count,
@@ -357,3 +353,45 @@ async def cycle(d, st):
            f"Target: {tp_px:.2f}  (2R)\n"
            f"Confidence: {conf}%\n"
            f"EMA{FAST}/{SLOW} cross | RSI {r:.0f} | {HTF_MIN}m trend agrees")
+    notify(f"SIGNAL: {word} gold ({conf}%)", msg, "signal", "high",
+           "chart_with_upwards_trend" if sig == "up" else "chart_with_downwards_trend")
+    st["day_signals"] += 1
+    st["last_signal_ts"] = time.time()
+
+
+async def check_mode():
+    d = Deriv()
+    await d.connect()
+    r = await d.call({"active_symbols": "brief", "product_type": "basic"})
+    for s in r["active_symbols"]:
+        if "XAU" in json.dumps(s):
+            print("Gold symbol:", s.get("symbol") or s.get("underlying_symbol"))
+    print("Last candle:", (await d.candles())[-1])
+
+
+async def main():
+    if "--check" in sys.argv:
+        return await check_mode()
+    last_err = 0
+    while True:
+        try:
+            d = Deriv()
+            await d.connect()
+            print(f"Started: SIGNALS ONLY | {SYMBOL}", flush=True)
+            while True:
+                st = load_state()
+                await cycle(d, st)
+                save_state(st)
+                await asyncio.sleep(CHECK_EVERY_SEC)
+        except Exception as e:
+            if time.time() - last_err > 300:
+                print(f"Bot error: {type(e).__name__}: {e} - retrying", flush=True)
+                last_err = time.time()
+            await asyncio.sleep(10)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped.")
