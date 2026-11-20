@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-goldbot.py - Gold SIGNALS ONLY bot (Deriv public price data -> ntfy alerts).
-Places NO trades. No Deriv login or token needed.
+goldbot.py - Gold SIGNALS ONLY bot -> ntfy alerts.
+Price data: Deriv (public) first, Yahoo Finance (GC=F) fallback.
+Places NO trades. No login or token needed.
 
 pip install websockets requests
 env: NTFY_TOPIC, optional COPY_TOPIC, NEWS_RSS
-python goldbot.py --check   (test gold symbol + data)
+python goldbot.py --check   (test data source)
 python goldbot.py           (run)
 Works with goldctl.py (same state file).
 """
@@ -22,7 +23,9 @@ import requests
 import websockets
 
 # ================= CONFIG =================
-SYMBOL = "frxXAUUSD"
+SYMBOL = "frxXAUUSD"          # Deriv symbol
+YAHOO = "GC=F"                # fallback symbol
+NAME = "gold"
 BAR_MIN = 1
 CANDLES = 120
 FAST, SLOW, TREND = 9, 21, 50
@@ -55,7 +58,11 @@ COPY_TOPIC = os.environ.get("COPY_TOPIC", "")
 STATE_FILE = "goldbot_state.json"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-WS_URL = os.environ.get("DERIV_WS_URL", f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}")
+WS_URLS = [
+    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
+    f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}",
+]
+UA = {"User-Agent": "Mozilla/5.0"}
 # ==========================================
 
 
@@ -241,14 +248,25 @@ def copycat():
     return last
 
 
-# ---------- DERIV (public market data, no login) ----------
+# ---------- DATA (Deriv first, Yahoo Finance fallback) ----------
 class Deriv:
     def __init__(self):
         self.ws = None
         self.ids = itertools.count(1)
+        self.yahoo = False
 
     async def connect(self):
-        self.ws = await websockets.connect(WS_URL, ping_interval=20)
+        env = os.environ.get("DERIV_WS_URL")
+        for url in ([env] if env else WS_URLS):
+            try:
+                self.ws = await websockets.connect(
+                    url, ping_interval=20, origin="https://deriv.com", open_timeout=15)
+                self.yahoo = False
+                return
+            except Exception as e:
+                print(f"Deriv connect failed ({url.split('?')[0]}): {e}", flush=True)
+        print("Using Yahoo Finance data instead", flush=True)
+        self.yahoo = True
 
     async def call(self, payload):
         rid = next(self.ids)
@@ -261,7 +279,25 @@ class Deriv:
                     raise DerivError(f"{e.get('code')}: {e.get('message')}")
                 return msg
 
+    def _yahoo_candles(self, gran, count):
+        interval = {60: "1m", 900: "15m"}.get(gran, "1m")
+        rng = "2d" if interval == "1m" else "5d"
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{YAHOO}",
+                         params={"interval": interval, "range": rng}, headers=UA, timeout=15)
+        r.raise_for_status()
+        res = r.json()["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        out = []
+        for i, ts in enumerate(res["timestamp"]):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            if None in (o, h, l, c):
+                continue
+            out.append({"epoch": ts, "open": o, "high": h, "low": l, "close": c})
+        return out[-count:]
+
     async def candles(self, gran=BAR_MIN * 60, count=CANDLES):
+        if self.yahoo:
+            return await asyncio.to_thread(self._yahoo_candles, gran, count)
         r = await self.call({"ticks_history": SYMBOL, "adjust_start_time": 1, "count": count,
                              "end": "latest", "granularity": gran, "style": "candles"})
         return r["candles"]
@@ -304,10 +340,10 @@ async def cycle(d, st):
     st["last_price"] = price
 
     if st["price_above"] is not None and price >= st["price_above"]:
-        notify("ALERT price", f"Gold {price:.2f} >= {st['price_above']}", "alert", "high", "bell")
+        notify("ALERT price", f"{NAME} {price:.2f} >= {st['price_above']}", "alert", "high", "bell")
         st["price_above"] = None
     if st["price_below"] is not None and price <= st["price_below"]:
-        notify("ALERT price", f"Gold {price:.2f} <= {st['price_below']}", "alert", "high", "bell")
+        notify("ALERT price", f"{NAME} {price:.2f} <= {st['price_below']}", "alert", "high", "bell")
         st["price_below"] = None
 
     if st["kill"]:
@@ -353,7 +389,7 @@ async def cycle(d, st):
            f"Target: {tp_px:.2f}  (2R)\n"
            f"Confidence: {conf}%\n"
            f"EMA{FAST}/{SLOW} cross | RSI {r:.0f} | {HTF_MIN}m trend agrees")
-    notify(f"SIGNAL: {word} gold ({conf}%)", msg, "signal", "high",
+    notify(f"SIGNAL: {word} {NAME} ({conf}%)", msg, "signal", "high",
            "chart_with_upwards_trend" if sig == "up" else "chart_with_downwards_trend")
     st["day_signals"] += 1
     st["last_signal_ts"] = time.time()
@@ -362,10 +398,7 @@ async def cycle(d, st):
 async def check_mode():
     d = Deriv()
     await d.connect()
-    r = await d.call({"active_symbols": "brief", "product_type": "basic"})
-    for s in r["active_symbols"]:
-        if "XAU" in json.dumps(s):
-            print("Gold symbol:", s.get("symbol") or s.get("underlying_symbol"))
+    print("Source:", "Yahoo Finance" if d.yahoo else "Deriv")
     print("Last candle:", (await d.candles())[-1])
 
 
@@ -377,7 +410,8 @@ async def main():
         try:
             d = Deriv()
             await d.connect()
-            print(f"Started: SIGNALS ONLY | {SYMBOL}", flush=True)
+            print(f"Started: SIGNALS ONLY | {NAME} | source: "
+                  f"{'Yahoo Finance' if d.yahoo else 'Deriv'}", flush=True)
             while True:
                 st = load_state()
                 await cycle(d, st)
