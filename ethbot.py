@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 ethbot.py - Ethereum SIGNALS ONLY bot -> ntfy alerts.
-Price data: Deriv (public) first, Yahoo Finance (ETH-USD) fallback.
-Places NO trades. No login or token needed.
+Price data: Yahoo Finance (ETH-USD). No trades, no login, no token.
 
-pip install websockets requests
+pip install requests
 env: NTFY_TOPIC, optional COPY_TOPIC, NEWS_RSS
-python ethbot.py --check   (test data source)
+python ethbot.py --check   (test data)
 python ethbot.py           (run)
 """
-import asyncio
 import datetime as dt
-import itertools
 import json
 import os
 import sys
@@ -19,11 +16,9 @@ import time
 import xml.etree.ElementTree as ET
 
 import requests
-import websockets
 
 # ================= CONFIG =================
-SYMBOL = "cryETHUSD"          # Deriv symbol
-YAHOO = "ETH-USD"             # fallback symbol
+YAHOO = "ETH-USD"
 NAME = "ETH"
 BAR_MIN = 1
 CANDLES = 120
@@ -33,7 +28,8 @@ HTF_MIN = 15                  # higher-timeframe trend check
 CHECK_EVERY_SEC = 15
 FRESH_MIN = 10
 
-SEND_TO_NTFY = {"signal"}     # add "alert" to also get price alerts
+# "signal" = BUY/SELL alerts, "status" = bot started message, "alert" = price alerts
+SEND_TO_NTFY = {"signal", "status"}
 
 MIN_SCORE = 2                 # analyst checks passed, out of 3
 MIN_CONFIDENCE = 55           # skip signals scoring below this (0-100)
@@ -57,17 +53,8 @@ COPY_TOPIC = os.environ.get("COPY_TOPIC", "")
 
 STATE_FILE = "ethbot_state.json"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
-APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-WS_URLS = [
-    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
-    f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}",
-]
 UA = {"User-Agent": "Mozilla/5.0"}
 # ==========================================
-
-
-class DerivError(Exception):
-    pass
 
 
 def notify(title, msg, kind="alert", priority="default", tags=""):
@@ -107,6 +94,31 @@ def save_state(st):
     with open(tmp, "w") as f:
         json.dump(st, f, indent=2)
     os.replace(tmp, STATE_FILE)
+
+
+# ---------- DATA (Yahoo Finance) ----------
+def get_candles(gran=BAR_MIN * 60, count=CANDLES):
+    interval = {60: "1m", 900: "15m"}.get(gran, "1m")
+    rng = "2d" if interval == "1m" else "5d"
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            r = requests.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{YAHOO}",
+                             params={"interval": interval, "range": rng},
+                             headers=UA, timeout=15)
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            out = []
+            for i, ts in enumerate(res["timestamp"]):
+                o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+                if None in (o, h, l, c):
+                    continue
+                out.append({"epoch": ts, "open": o, "high": h, "low": l, "close": c})
+            return out[-count:]
+        except Exception as e:
+            last = e
+    raise last
 
 
 # ---------- INDICATORS ----------
@@ -243,63 +255,8 @@ def copycat():
     return last
 
 
-# ---------- DATA (Deriv first, Yahoo Finance fallback) ----------
-class Deriv:
-    def __init__(self):
-        self.ws = None
-        self.ids = itertools.count(1)
-        self.yahoo = False
-
-    async def connect(self):
-        env = os.environ.get("DERIV_WS_URL")
-        for url in ([env] if env else WS_URLS):
-            try:
-                self.ws = await websockets.connect(
-                    url, ping_interval=20, origin="https://deriv.com", open_timeout=15)
-                self.yahoo = False
-                return
-            except Exception as e:
-                print(f"Deriv connect failed ({url.split('?')[0]}): {e}", flush=True)
-        print("Using Yahoo Finance data instead", flush=True)
-        self.yahoo = True
-
-    async def call(self, payload):
-        rid = next(self.ids)
-        await self.ws.send(json.dumps(dict(payload, req_id=rid)))
-        while True:
-            msg = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=30))
-            if msg.get("req_id") == rid:
-                if msg.get("error"):
-                    e = msg["error"]
-                    raise DerivError(f"{e.get('code')}: {e.get('message')}")
-                return msg
-
-    def _yahoo_candles(self, gran, count):
-        interval = {60: "1m", 900: "15m"}.get(gran, "1m")
-        rng = "2d" if interval == "1m" else "5d"
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{YAHOO}",
-                         params={"interval": interval, "range": rng}, headers=UA, timeout=15)
-        r.raise_for_status()
-        res = r.json()["chart"]["result"][0]
-        q = res["indicators"]["quote"][0]
-        out = []
-        for i, ts in enumerate(res["timestamp"]):
-            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-            if None in (o, h, l, c):
-                continue
-            out.append({"epoch": ts, "open": o, "high": h, "low": l, "close": c})
-        return out[-count:]
-
-    async def candles(self, gran=BAR_MIN * 60, count=CANDLES):
-        if self.yahoo:
-            return await asyncio.to_thread(self._yahoo_candles, gran, count)
-        r = await self.call({"ticks_history": SYMBOL, "adjust_start_time": 1, "count": count,
-                             "end": "latest", "granularity": gran, "style": "candles"})
-        return r["candles"]
-
-
 # ---------- MAIN LOOP ----------
-async def gates(d, st, candles, direction):
+def gates(st, candles, direction):
     ok, why = screener(candles)
     if not ok:
         return False, "screener: " + why
@@ -311,26 +268,26 @@ async def gates(d, st, candles, direction):
     if bad:
         return False, "news blackout " + when
     want = 1 if direction == "up" else -1
-    nb = await asyncio.to_thread(news_bias)
+    nb = news_bias()
     if nb and nb != want:
         return False, "news bias against"
     score, _ = analyst(candles[:-1], direction)
     if score < MIN_SCORE:
         return False, f"analyst score {score}/3"
-    if htf_trend(await d.candles(HTF_MIN * 60, 80)) != direction:
+    if htf_trend(get_candles(HTF_MIN * 60, 80)) != direction:
         return False, f"{HTF_MIN}m trend disagrees"
-    cc = await asyncio.to_thread(copycat)
+    cc = copycat()
     if cc and cc != want:
         return False, "copycat source disagrees"
     return True, "ok"
 
 
-async def cycle(d, st):
+def cycle(st):
     today = dt.datetime.utcnow().strftime("%Y-%m-%d")
     if st["day"] != today:
         st.update(day=today, day_signals=0)
 
-    candles = await d.candles()
+    candles = get_candles()
     price = float(candles[-1]["close"])
     st["last_price"] = price
 
@@ -362,14 +319,13 @@ async def cycle(d, st):
         return
     st["last_cross_epoch"] = closed[-1]["epoch"]
 
-    ok, why = await gates(d, st, candles, sig)
+    ok, why = gates(st, candles, sig)
     if not ok:
         print(f"Skipped {sig} cross: {why}", flush=True)
         return
 
-    htf = await d.candles(HTF_MIN * 60, 80)
-    nb = await asyncio.to_thread(news_bias)
-    conf = confidence(candles, htf, sig, nb)
+    htf = get_candles(HTF_MIN * 60, 80)
+    conf = confidence(candles, htf, sig, news_bias())
     if conf < MIN_CONFIDENCE:
         print(f"Skipped {sig} cross: confidence {conf}%", flush=True)
         return
@@ -390,37 +346,30 @@ async def cycle(d, st):
     st["last_signal_ts"] = time.time()
 
 
-async def check_mode():
-    d = Deriv()
-    await d.connect()
-    print("Source:", "Yahoo Finance" if d.yahoo else "Deriv")
-    print("Last candle:", (await d.candles())[-1])
-
-
-async def main():
+def main():
     if "--check" in sys.argv:
-        return await check_mode()
+        print("Last candle:", get_candles()[-1])
+        return
+    notify("ETHBot running",
+           f"Bot started | {NAME} | Yahoo Finance {YAHOO} | signals only",
+           "status", "default", "robot")
     last_err = 0
     while True:
         try:
-            d = Deriv()
-            await d.connect()
-            print(f"Started: SIGNALS ONLY | {NAME} | source: "
-                  f"{'Yahoo Finance' if d.yahoo else 'Deriv'}", flush=True)
-            while True:
-                st = load_state()
-                await cycle(d, st)
-                save_state(st)
-                await asyncio.sleep(CHECK_EVERY_SEC)
+            st = load_state()
+            cycle(st)
+            save_state(st)
+        except KeyboardInterrupt:
+            print("Stopped.")
+            return
         except Exception as e:
             if time.time() - last_err > 300:
                 print(f"Bot error: {type(e).__name__}: {e} - retrying", flush=True)
                 last_err = time.time()
-            await asyncio.sleep(10)
+            time.sleep(10)
+            continue
+        time.sleep(CHECK_EVERY_SEC)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Stopped.")
+    main()
