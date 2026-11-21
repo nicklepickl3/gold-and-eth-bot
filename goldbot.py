@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-goldbot.py - Gold SIGNALS ONLY bot -> ntfy alerts.
+goldbot.py - Gold SIGNALS ONLY bot -> ntfy alerts, with timed entries.
 Price data: Yahoo Finance (GC=F). No trades, no login, no token.
 
+Flow: SETUP (enter at HH:MM) -> ENTER NOW or CANCELLED at that time.
+
 pip install requests
-env: NTFY_TOPIC, optional COPY_TOPIC, NEWS_RSS
+env: NTFY_TOPIC, optional TIMEZONE, COPY_TOPIC, NEWS_RSS
 python goldbot.py --check   (test data)
 python goldbot.py           (run)
 Works with goldctl.py (same state file).
 """
 import datetime as dt
 import json
+import math
 import os
 import sys
 import time
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -29,7 +33,15 @@ HTF_MIN = 15                  # higher-timeframe trend check
 CHECK_EVERY_SEC = 15
 FRESH_MIN = 10
 
-# "signal" = BUY/SELL alerts, "status" = bot started message, "alert" = price alerts
+# timed entry
+ENTRY_DELAY_MIN = 5           # enter this many minutes after the setup
+ENTRY_WINDOW_MIN = 3          # entry stays valid this long after the entry time
+MAX_CHASE_ATR = 0.5           # cancel if price moved more than this many ATRs from setup
+
+# your time zone for alert times, e.g. "America/New_York", "Europe/London", "UTC"
+TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+
+# "signal" = SETUP/ENTER/CANCELLED alerts, "status" = bot started, "alert" = price alerts
 SEND_TO_NTFY = {"signal", "status"}
 
 MIN_SCORE = 2                 # analyst checks passed, out of 3
@@ -41,7 +53,7 @@ ATR_MIN_PCT = 0.0001
 ATR_MAX_PCT = 0.003
 # signal limits
 MAX_SIGNALS_DAY = 8
-MIN_GAP_MIN = 15              # minimum minutes between signals
+MIN_GAP_MIN = 15              # minimum minutes between setups
 # news: blackout windows ("YYYY-MM-DD HH:MM" UTC, minutes each side)
 NEWS_BLACKOUTS = [
     # ("2026-12-10 13:30", 30),
@@ -55,6 +67,15 @@ STATE_FILE = "goldbot_state.json"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 UA = {"User-Agent": "Mozilla/5.0"}
 # ==========================================
+
+try:
+    TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    TZ = dt.timezone.utc
+
+
+def fmt_time(ts):
+    return dt.datetime.fromtimestamp(ts, TZ).strftime("%H:%M %Z")
 
 
 def notify(title, msg, kind="alert", priority="default", tags=""):
@@ -72,7 +93,7 @@ def default_state():
     return {
         "contract_id": None, "dir": None, "last_cross_epoch": 0,
         "price_above": None, "price_below": None,
-        "paused": False, "kill": False,
+        "paused": False, "kill": False, "pending": None,
         "day": "", "day_signals": 0, "last_signal_ts": 0,
         "last_price": None, "balance": None, "day_pnl": 0.0, "updated": None,
     }
@@ -143,6 +164,12 @@ def atr(cs, n=ATR_N):
         h, l, pc = float(cs[i]["high"]), float(cs[i]["low"]), float(cs[i - 1]["close"])
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs) / n
+
+
+def levels(sig, price, a):
+    if sig == "up":
+        return price - 1.5 * a, price + 3.0 * a
+    return price + 1.5 * a, price - 3.0 * a
 
 
 # ---------- ANALYST ----------
@@ -260,7 +287,7 @@ def copycat():
     return last
 
 
-# ---------- MAIN LOOP ----------
+# ---------- GATES ----------
 def gates(st, candles, direction):
     ok, why = screener(candles)
     if not ok:
@@ -287,6 +314,49 @@ def gates(st, candles, direction):
     return True, "ok"
 
 
+# ---------- TIMED ENTRY ----------
+def handle_pending(st, candles, price):
+    p = st["pending"]
+    now = time.time()
+    if now < p["enter_at"]:
+        return  # still waiting for the entry time
+
+    word = "BUY" if p["dir"] == "up" else "SELL"
+    valid_until = p["enter_at"] + ENTRY_WINDOW_MIN * 60
+    closes = [float(c["close"]) for c in candles[:-1]]
+    f, s = ema(closes, FAST), ema(closes, SLOW)
+    still = f[-1] > s[-1] if p["dir"] == "up" else f[-1] < s[-1]
+    moved = (price - p["price"]) * (1 if p["dir"] == "up" else -1)  # + = in trade direction
+    limit = MAX_CHASE_ATR * p["atr"]
+
+    reason = None
+    if now > valid_until:
+        reason = "entry window passed"
+    elif not still:
+        reason = "trend flipped, EMA cross is gone"
+    elif moved > limit:
+        reason = f"price already ran to {price:.2f}, don't chase"
+    elif moved < -limit:
+        reason = f"price moved against the setup ({price:.2f})"
+
+    if reason:
+        notify(f"CANCELLED: {word} {NAME} setup",
+               f"Skip this one: {reason}.\nSetup price was {p['price']:.2f}.",
+               "signal", "high", "x")
+    else:
+        a = atr(candles)
+        sl_px, tp_px = levels(p["dir"], price, a)
+        msg = (f"Enter {word} now at ~{price:.2f}\n"
+               f"Valid until {fmt_time(valid_until)}\n"
+               f"Stop:   {sl_px:.2f}\n"
+               f"Target: {tp_px:.2f}  (2R)\n"
+               f"Setup confidence: {p['conf']}%")
+        notify(f"ENTER NOW: {word} {NAME}", msg, "signal", "urgent",
+               "white_check_mark")
+    st["pending"] = None
+
+
+# ---------- MAIN LOOP ----------
 def cycle(st):
     today = dt.datetime.utcnow().strftime("%Y-%m-%d")
     if st["day"] != today:
@@ -304,8 +374,12 @@ def cycle(st):
         st["price_below"] = None
 
     if st["kill"]:
-        st["paused"], st["kill"] = True, False
+        st["paused"], st["pending"], st["kill"] = True, None, False
     if st["paused"]:
+        return
+
+    if st.get("pending"):
+        handle_pending(st, candles, price)
         return
 
     closed = candles[:-1]
@@ -335,28 +409,35 @@ def cycle(st):
         print(f"Skipped {sig} cross: confidence {conf}%", flush=True)
         return
 
-    word = "BUY" if sig == "up" else "SELL"
+    # --- create the timed setup ---
+    now = time.time()
     a = atr(candles)
+    enter_at = math.ceil((now + ENTRY_DELAY_MIN * 60) / 60) * 60
+    zone = MAX_CHASE_ATR * a
+    sl_px, tp_px = levels(sig, price, a)
     r = rsi(closes)
-    sl_px = price - 1.5 * a if sig == "up" else price + 1.5 * a
-    tp_px = price + 3.0 * a if sig == "up" else price - 3.0 * a
-    msg = (f"Entry:  {price:.2f}\n"
-           f"Stop:   {sl_px:.2f}\n"
-           f"Target: {tp_px:.2f}  (2R)\n"
-           f"Confidence: {conf}%\n"
-           f"EMA{FAST}/{SLOW} cross | RSI {r:.0f} | {HTF_MIN}m trend agrees")
-    notify(f"SIGNAL: {word} {NAME} ({conf}%)", msg, "signal", "high",
-           "chart_with_upwards_trend" if sig == "up" else "chart_with_downwards_trend")
+    word = "BUY" if sig == "up" else "SELL"
+    msg = (f"Do NOT enter now. Setup price: {price:.2f}\n"
+           f"Enter at: {fmt_time(enter_at)} (in {ENTRY_DELAY_MIN} min)\n"
+           f"Only if price is {price - zone:.2f} - {price + zone:.2f}\n"
+           f"Est. stop {sl_px:.2f} | target {tp_px:.2f}\n"
+           f"Confidence: {conf}% | EMA{FAST}/{SLOW} cross | RSI {r:.0f} | {HTF_MIN}m trend agrees\n"
+           f"I'll send ENTER NOW or CANCELLED then.")
+    notify(f"SETUP: {word} {NAME} - enter {fmt_time(enter_at)}", msg, "signal", "high",
+           "hourglass_flowing_sand")
+    st["pending"] = {"dir": sig, "price": price, "atr": a, "conf": conf,
+                     "created": now, "enter_at": enter_at}
     st["day_signals"] += 1
-    st["last_signal_ts"] = time.time()
+    st["last_signal_ts"] = now
 
 
 def main():
     if "--check" in sys.argv:
         print("Last candle:", get_candles()[-1])
+        print("Time zone:", TIMEZONE, "| now:", fmt_time(time.time()))
         return
     notify("GoldBot running",
-           f"Bot started | {NAME} | Yahoo Finance {YAHOO} | signals only",
+           f"Bot started | {NAME} | Yahoo Finance {YAHOO} | signals only | times in {TIMEZONE}",
            "status", "default", "robot")
     last_err = 0
     while True:
